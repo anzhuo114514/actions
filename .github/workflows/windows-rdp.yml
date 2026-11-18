@@ -1,0 +1,80 @@
+name: Windows Cloud RDP
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    # GitHub 托管 runner 单个任务上限就是 360 分钟
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Enable RDP (Tailscale only)
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          # 保持 NLA 开启（UserAuthentication=1），mstsc 本地账号可正常登录
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+
+          # 只允许 Tailscale 网段（100.64.0.0/10）访问 3389，而不是对所有网卡开放
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" | Disable-NetFirewallRule
+          foreach ($proto in "TCP", "UDP") {
+            New-NetFirewallRule -DisplayName "RDP-$proto over Tailscale" -Direction Inbound `
+              -Protocol $proto -LocalPort 3389 -RemoteAddress 100.64.0.0/10 -Action Allow | Out-Null
+          }
+
+      - name: 2. Create admin account
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:RDP_PASSWORD)) { throw "缺少仓库 Secret：RDP_PASSWORD" }
+          $pw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name "NvdAdmin" -Password $pw -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          Add-LocalGroupMember -Group "Administrators" -Member "NvdAdmin"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "NvdAdmin"
+
+      - name: 3. Install & connect Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:TAILSCALE_AUTHKEY)) { throw "缺少仓库 Secret：TAILSCALE_AUTHKEY" }
+
+          # 下载并静默安装（带重试）
+          $msi = Join-Path $env:RUNNER_TEMP "tailscale.msi"
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $msi -MaximumRetryCount 3 -RetryIntervalSec 5
+          Start-Process msiexec -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+
+          # 连接 tailnet（up 会阻塞到连接成功，无需固定 sleep）
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          & $ts up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" --unattended --accept-dns=false
+          if ($LASTEXITCODE -ne 0) { throw "tailscale up 失败" }
+
+          # 轮询获取 IP，最多等 60 秒
+          $ip = $null
+          for ($i = 0; $i -lt 30 -and -not $ip; $i++) {
+            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if (-not $ip) { Start-Sleep -Seconds 2 }
+          }
+          if (-not $ip) { throw "没有拿到 Tailscale IP" }
+
+          $info = @"
+          RDP SERVER IS READY
+          Tailscale IP : $ip
+          Username     : NvdAdmin
+          Password     : (你设置的 RDP_PASSWORD)
+          mstsc 连接   : $ip
+          "@
+          Write-Host $info
+          $info | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: 4. Keep alive
+        run: |
+          # 一直挂着，直到 350 分钟结束（留 10 分钟余量）或你在 Actions 页面手动 Cancel
+          $start = Get-Date
+          while (((Get-Date) - $start).TotalMinutes -lt 350) {
+            Start-Sleep -Seconds 600
+            Write-Host ("[{0:N0} min] Server running..." -f ((Get-Date) - $start).TotalMinutes)
+          }
